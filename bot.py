@@ -9,6 +9,7 @@ import logging
 import signal
 import sys
 import time
+from datetime import datetime, timedelta
 
 # Enable logging
 logging.basicConfig(
@@ -17,19 +18,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress noisy httpx logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # Initialize
 db = MessageDB()
 summarizer = Summarizer()
 
-# Global flag for graceful shutdown
-shutdown_flag = False
+# Track startup time for conflict grace period
+STARTUP_TIME = datetime.now()
+CONFLICT_GRACE_PERIOD = timedelta(seconds=90)  # Suppress conflict errors for 90 seconds after start
 
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully"""
-    global shutdown_flag
     signal_name = signal.Signals(signum).name
-    logger.info(f"🛑 Received {signal_name}, initiating graceful shutdown...")
-    shutdown_flag = True
+    logger.info(f"🛑 Received {signal_name}, shutting down...")
     set_bot_status(False)
     sys.exit(0)
 
@@ -59,7 +62,7 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         user_id = user.id
         user_name = user.first_name or "Unknown"
-        username = user.username  # Can be None
+        username = user.username
         message_text = update.message.text
         
         if not message_text.startswith('/'):
@@ -75,7 +78,6 @@ async def catchup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     
-    # Parse time parameter
     if context.args and context.args[0].isdigit():
         hours = int(context.args[0])
         messages = db.get_messages_last_hours(chat_id, hours)
@@ -91,10 +93,8 @@ async def catchup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Generate summary
     summary = summarizer.summarize(messages)
     
-    # Get participants with usernames
     participants_set = set()
     for msg in messages:
         name = msg[0]
@@ -128,7 +128,6 @@ async def who_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No one has sent messages today yet!")
         return
     
-    # Format with username if available
     lines = []
     for name, username in participants:
         if username:
@@ -158,13 +157,10 @@ async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     chat_id = update.effective_chat.id
-    
-    # Parse arguments: names and optional hours
     args = context.args
     hours = None
     names = []
     
-    # Check if last argument is a number (hours)
     if args[-1].isdigit():
         hours = int(args[-1])
         raw_names = args[:-1]
@@ -173,7 +169,6 @@ async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_names = args
         time_label = "today"
     
-    # Strip @ from usernames
     for name in raw_names:
         names.append(name.lstrip('@'))
     
@@ -181,7 +176,6 @@ async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please specify at least one name or @username!")
         return
     
-    # Get messages from these people
     messages = db.get_messages_by_person(chat_id, names, hours)
     
     if not messages:
@@ -192,7 +186,6 @@ async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Generate summary
     summary = summarizer.summarize(messages)
     names_text = " & ".join(names)
     
@@ -225,9 +218,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     """Set up the bot commands menu and clear any existing webhooks"""
-    # CRITICAL: Delete any existing webhooks to prevent conflicts
     await application.bot.delete_webhook(drop_pending_updates=True)
-    logger.info("🔄 Cleared existing webhooks and pending updates")
+    logger.info("🔄 Cleared webhooks and pending updates")
     
     commands = [
         BotCommand("start", "Start the bot and see info"),
@@ -236,27 +228,33 @@ async def post_init(application: Application):
         BotCommand("who", "See who's been active today"),
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("✅ Command menu set up successfully!")
+    logger.info("✅ Command menu ready")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors gracefully"""
-    logger.error(f"❌ Exception while handling an update: {context.error}")
-    
+    """Handle errors - suppress expected conflicts during startup"""
     if isinstance(context.error, Conflict):
-        logger.error("⚠️ Conflict error - another bot instance may be running!")
+        # During deployment, conflicts are expected - only log after grace period
+        if datetime.now() - STARTUP_TIME < CONFLICT_GRACE_PERIOD:
+            return  # Silently ignore during grace period
+        logger.warning("⚠️ Conflict detected - this usually resolves automatically")
     elif isinstance(context.error, (NetworkError, TimedOut)):
-        logger.warning("⚠️ Network error - will retry automatically")
+        logger.debug("Network hiccup - retrying automatically")
+    else:
+        logger.error(f"❌ Error: {context.error}")
 
 def main():
-    """Main function with robust error handling and retry logic"""
+    """Main function"""
     logger.info("🤖 Starting Telegram Summarizer Bot...")
-    logger.info("✅ Using local summarization (instant & unlimited)")
     
-    # Start keep_alive server for UptimeRobot
+    # Start keep_alive server
     keep_alive()
     set_bot_status(True)
     
-    # Build application with timeout settings
+    # Wait for any old instances to fully shut down
+    logger.info("⏳ Waiting 5 seconds for old instances to terminate...")
+    time.sleep(5)
+    
+    # Build application
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -267,38 +265,32 @@ def main():
         .build()
     )
     
-    # Add command handlers
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("catchup", catchup_command))
     application.add_handler(CommandHandler("person", person_command))
     application.add_handler(CommandHandler("who", who_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_message))
-    
-    # Add error handler
     application.add_error_handler(error_handler)
     
-    logger.info("🚀 Bot is running! Press Ctrl+C to stop.")
+    logger.info("🚀 Bot is running!")
     
-    # Run polling with drop_pending_updates to prevent conflict errors
     try:
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
-            poll_interval=1.0,
+            poll_interval=2.0,  # Slower polling = less chance of conflict
             timeout=30
         )
-    except Conflict as e:
-        logger.error(f"❌ Conflict error: {e}")
-        logger.error("⚠️ Another bot instance is running. Waiting 10 seconds...")
-        time.sleep(10)
-        sys.exit(1)
+    except Conflict:
+        logger.info("Instance conflict detected, exiting gracefully...")
+        sys.exit(0)
     except Exception as e:
-        logger.error(f"❌ Unexpected error: {e}")
+        logger.error(f"Fatal error: {e}")
         raise
     finally:
         set_bot_status(False)
         db.close()
-        logger.info("👋 Bot stopped")
 
 if __name__ == '__main__':
     main()
