@@ -5,6 +5,7 @@ from summarizer import Summarizer
 from config import TELEGRAM_TOKEN
 from keep_alive import keep_alive
 import logging
+import nltk
 
 # Enable logging
 logging.basicConfig(
@@ -208,3 +209,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
