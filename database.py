@@ -9,8 +9,7 @@ class MessageDB:
         self.max_retries = max_retries
         self.conn = None
         self._connect()
-        self.create_table()
-        self._migrate_schema()
+        self._setup_database()
     
     def _connect(self):
         """Establish database connection with retry logic"""
@@ -35,21 +34,38 @@ class MessageDB:
             logging.warning("⚠️ Database connection lost, reconnecting...")
             self._connect()
     
-    def create_table(self):
+    def _setup_database(self):
+        """Create table, migrate schema, then create indexes"""
         self._ensure_connection()
         cursor = self.conn.cursor()
+        
+        # Step 1: Create base table if not exists
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER,
-                user_id INTEGER,
                 user_name TEXT,
-                username TEXT,
                 message_text TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Create indexes for faster queries
+        self.conn.commit()
+        
+        # Step 2: Migrate schema - add new columns if they don't exist
+        cursor.execute("PRAGMA table_info(messages)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'user_id' not in columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN user_id INTEGER")
+            logging.info("📦 Added user_id column")
+        
+        if 'username' not in columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN username TEXT")
+            logging.info("📦 Added username column")
+        
+        self.conn.commit()
+        
+        # Step 3: Create indexes (now columns exist)
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_chat_timestamp 
             ON messages(chat_id, timestamp)
@@ -63,27 +79,7 @@ class MessageDB:
             ON messages(user_id)
         ''')
         self.conn.commit()
-    
-    def _migrate_schema(self):
-        """Add new columns if they don't exist (for existing databases)"""
-        self._ensure_connection()
-        cursor = self.conn.cursor()
-        try:
-            # Check if columns exist
-            cursor.execute("PRAGMA table_info(messages)")
-            columns = [col[1] for col in cursor.fetchall()]
-            
-            if 'user_id' not in columns:
-                cursor.execute("ALTER TABLE messages ADD COLUMN user_id INTEGER")
-                logging.info("📦 Added user_id column to messages table")
-            
-            if 'username' not in columns:
-                cursor.execute("ALTER TABLE messages ADD COLUMN username TEXT")
-                logging.info("📦 Added username column to messages table")
-            
-            self.conn.commit()
-        except sqlite3.Error as e:
-            logging.error(f"❌ Schema migration failed: {e}")
+        logging.info("✅ Database schema ready")
     
     def add_message(self, chat_id, user_id, user_name, username, message_text):
         """Save a message with full user info"""
