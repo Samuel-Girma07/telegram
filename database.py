@@ -128,19 +128,21 @@ class MessageDB:
             return []
     
     def get_messages_by_person(self, chat_id, person_names, hours=None):
-        """Get messages from specific person(s) - searches by name OR username (case-insensitive)"""
+        """Get messages from specific person(s) - searches by name OR username (partial, case-insensitive)"""
         self._ensure_connection()
         try:
             cursor = self.conn.cursor()
             
-            # Build conditions for each name (match user_name OR username)
+            # Build conditions for each name using LIKE for partial matching
+            # This allows "YisakValhalla" to match both username "YisakValhalla" AND first name "Yisak"
             conditions = []
             params = [chat_id]
             
             for name in person_names:
-                name_lower = name.lower()
-                conditions.append("(LOWER(user_name) = ? OR LOWER(username) = ?)")
-                params.extend([name_lower, name_lower])
+                name_pattern = f"%{name.lower()}%"
+                # Match if user_name contains the search term OR username contains it
+                conditions.append("(LOWER(user_name) LIKE ? OR LOWER(COALESCE(username, '')) LIKE ?)")
+                params.extend([name_pattern, name_pattern])
             
             name_condition = " OR ".join(conditions)
             
