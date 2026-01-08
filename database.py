@@ -10,13 +10,14 @@ class MessageDB:
         self.conn = None
         self._connect()
         self.create_table()
+        self._migrate_schema()
     
     def _connect(self):
         """Establish database connection with retry logic"""
         for attempt in range(self.max_retries):
             try:
                 self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
+                self.conn.execute("PRAGMA journal_mode=WAL")
                 logging.info(f"✅ Database connected: {self.db_path}")
                 return
             except sqlite3.Error as e:
@@ -41,30 +42,62 @@ class MessageDB:
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER,
+                user_id INTEGER,
                 user_name TEXT,
+                username TEXT,
                 message_text TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Create index for faster queries
+        # Create indexes for faster queries
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_chat_timestamp 
             ON messages(chat_id, timestamp)
         ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_username 
+            ON messages(username)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_user_id 
+            ON messages(user_id)
+        ''')
         self.conn.commit()
     
-    def add_message(self, chat_id, user_name, message_text):
+    def _migrate_schema(self):
+        """Add new columns if they don't exist (for existing databases)"""
+        self._ensure_connection()
+        cursor = self.conn.cursor()
+        try:
+            # Check if columns exist
+            cursor.execute("PRAGMA table_info(messages)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'user_id' not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN user_id INTEGER")
+                logging.info("📦 Added user_id column to messages table")
+            
+            if 'username' not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN username TEXT")
+                logging.info("📦 Added username column to messages table")
+            
+            self.conn.commit()
+        except sqlite3.Error as e:
+            logging.error(f"❌ Schema migration failed: {e}")
+    
+    def add_message(self, chat_id, user_id, user_name, username, message_text):
+        """Save a message with full user info"""
         self._ensure_connection()
         try:
             cursor = self.conn.cursor()
             cursor.execute('''
-                INSERT INTO messages (chat_id, user_name, message_text)
-                VALUES (?, ?, ?)
-            ''', (chat_id, user_name, message_text))
+                INSERT INTO messages (chat_id, user_id, user_name, username, message_text)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (chat_id, user_id, user_name, username, message_text))
             self.conn.commit()
         except sqlite3.Error as e:
             logging.error(f"❌ Failed to save message: {e}")
-            self._connect()  # Try to reconnect
+            self._connect()
     
     def get_messages_today(self, chat_id):
         self._ensure_connection()
@@ -72,7 +105,7 @@ class MessageDB:
             cursor = self.conn.cursor()
             today = datetime.now().date()
             cursor.execute('''
-                SELECT user_name, message_text, timestamp
+                SELECT user_name, message_text, timestamp, username
                 FROM messages
                 WHERE chat_id = ? AND DATE(timestamp) = ?
                 ORDER BY timestamp
@@ -88,7 +121,7 @@ class MessageDB:
             cursor = self.conn.cursor()
             time_ago = datetime.now() - timedelta(hours=hours)
             cursor.execute('''
-                SELECT user_name, message_text, timestamp
+                SELECT user_name, message_text, timestamp, username
                 FROM messages
                 WHERE chat_id = ? AND timestamp >= ?
                 ORDER BY timestamp
@@ -99,30 +132,40 @@ class MessageDB:
             return []
     
     def get_messages_by_person(self, chat_id, person_names, hours=None):
-        """Get messages from specific person(s)"""
+        """Get messages from specific person(s) - searches by name OR username (case-insensitive)"""
         self._ensure_connection()
         try:
             cursor = self.conn.cursor()
-            placeholders = ','.join('?' * len(person_names))
+            
+            # Build conditions for each name (match user_name OR username)
+            conditions = []
+            params = [chat_id]
+            
+            for name in person_names:
+                name_lower = name.lower()
+                conditions.append("(LOWER(user_name) = ? OR LOWER(username) = ?)")
+                params.extend([name_lower, name_lower])
+            
+            name_condition = " OR ".join(conditions)
             
             if hours:
                 time_ago = datetime.now() - timedelta(hours=hours)
                 query = f'''
-                    SELECT user_name, message_text, timestamp
+                    SELECT user_name, message_text, timestamp, username
                     FROM messages
-                    WHERE chat_id = ? AND user_name IN ({placeholders}) AND timestamp >= ?
+                    WHERE chat_id = ? AND ({name_condition}) AND timestamp >= ?
                     ORDER BY timestamp
                 '''
-                params = [chat_id] + person_names + [time_ago]
+                params.append(time_ago)
             else:
                 today = datetime.now().date()
                 query = f'''
-                    SELECT user_name, message_text, timestamp
+                    SELECT user_name, message_text, timestamp, username
                     FROM messages
-                    WHERE chat_id = ? AND user_name IN ({placeholders}) AND DATE(timestamp) = ?
+                    WHERE chat_id = ? AND ({name_condition}) AND DATE(timestamp) = ?
                     ORDER BY timestamp
                 '''
-                params = [chat_id] + person_names + [today]
+                params.append(today)
             
             cursor.execute(query, params)
             return cursor.fetchall()
@@ -131,18 +174,18 @@ class MessageDB:
             return []
     
     def get_participants(self, chat_id):
-        """Get list of all participants who sent messages today"""
+        """Get list of all participants who sent messages today with their usernames"""
         self._ensure_connection()
         try:
             cursor = self.conn.cursor()
             today = datetime.now().date()
             cursor.execute('''
-                SELECT DISTINCT user_name
+                SELECT DISTINCT user_name, username
                 FROM messages
                 WHERE chat_id = ? AND DATE(timestamp) = ?
                 ORDER BY user_name
             ''', (chat_id, today))
-            return [row[0] for row in cursor.fetchall()]
+            return cursor.fetchall()
         except sqlite3.Error as e:
             logging.error(f"❌ Failed to fetch participants: {e}")
             return []

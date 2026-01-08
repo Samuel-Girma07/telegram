@@ -8,7 +8,7 @@ from keep_alive import keep_alive, set_bot_status
 import logging
 import signal
 import sys
-import asyncio
+import time
 
 # Enable logging
 logging.basicConfig(
@@ -49,18 +49,23 @@ async def private_chat_response(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Save all group messages to database"""
+    """Save all group messages to database with full user info"""
     if not is_group_chat(update):
         return
     
     if update.message and update.message.text:
         chat_id = update.effective_chat.id
-        user_name = update.effective_user.first_name or "Unknown"
+        user = update.effective_user
+        
+        user_id = user.id
+        user_name = user.first_name or "Unknown"
+        username = user.username  # Can be None
         message_text = update.message.text
         
         if not message_text.startswith('/'):
-            db.add_message(chat_id, user_name, message_text)
-            logger.info(f"💾 Saved: {user_name}: {message_text[:30]}...")
+            db.add_message(chat_id, user_id, user_name, username, message_text)
+            display = f"@{username}" if username else user_name
+            logger.info(f"💾 Saved: {display}: {message_text[:30]}...")
 
 async def catchup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate summary of all messages"""
@@ -89,9 +94,17 @@ async def catchup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Generate summary
     summary = summarizer.summarize(messages)
     
-    # Get participants
-    participants = list(set([msg[0] for msg in messages]))
-    participants_text = ", ".join(participants)
+    # Get participants with usernames
+    participants_set = set()
+    for msg in messages:
+        name = msg[0]
+        username = msg[3] if len(msg) > 3 else None
+        if username:
+            participants_set.add(f"{name} (@{username})")
+        else:
+            participants_set.add(name)
+    
+    participants_text = ", ".join(sorted(participants_set))
     
     response = (
         f"📝 *Catch Up Summary ({time_label})*\n\n"
@@ -103,7 +116,7 @@ async def catchup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(response, parse_mode='Markdown')
 
 async def who_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show who's been active today"""
+    """Show who's been active today with usernames"""
     if not is_group_chat(update):
         await private_chat_response(update, context)
         return
@@ -115,11 +128,19 @@ async def who_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No one has sent messages today yet!")
         return
     
-    response = "👥 *Active Today:*\n\n" + "\n".join([f"• {name}" for name in participants])
+    # Format with username if available
+    lines = []
+    for name, username in participants:
+        if username:
+            lines.append(f"• {name} (@{username})")
+        else:
+            lines.append(f"• {name}")
+    
+    response = "👥 *Active Today:*\n\n" + "\n".join(lines)
     await update.message.reply_text(response, parse_mode='Markdown')
 
 async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get messages from specific person(s)"""
+    """Get messages from specific person(s) - supports @username format"""
     if not is_group_chat(update):
         await private_chat_response(update, context)
         return
@@ -127,9 +148,10 @@ async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❓ *How to use:*\n\n"
+            "`/person @username` - What @username said today\n"
             "`/person John` - What John said today\n"
-            "`/person John Sarah` - What John & Sarah said\n"
-            "`/person John 3` - What John said in last 3 hours\n\n"
+            "`/person John @sarah` - What both said\n"
+            "`/person @user 3` - Last 3 hours\n\n"
             "Use `/who` to see who's active today",
             parse_mode='Markdown'
         )
@@ -145,14 +167,18 @@ async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if last argument is a number (hours)
     if args[-1].isdigit():
         hours = int(args[-1])
-        names = args[:-1]
+        raw_names = args[:-1]
         time_label = f"last {hours} hours"
     else:
-        names = args
+        raw_names = args
         time_label = "today"
     
+    # Strip @ from usernames
+    for name in raw_names:
+        names.append(name.lstrip('@'))
+    
     if not names:
-        await update.message.reply_text("Please specify at least one name!")
+        await update.message.reply_text("Please specify at least one name or @username!")
         return
     
     # Get messages from these people
@@ -162,7 +188,7 @@ async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         names_text = " & ".join(names)
         await update.message.reply_text(
             f"📭 No messages from {names_text} {time_label}.\n\n"
-            f"Tip: Names are case-sensitive. Use `/who` to see exact names."
+            f"Tip: Use `/who` to see who's active."
         )
         return
     
@@ -206,7 +232,7 @@ async def post_init(application: Application):
     commands = [
         BotCommand("start", "Start the bot and see info"),
         BotCommand("catchup", "Get summary of today's chat"),
-        BotCommand("person", "Get specific person's messages"),
+        BotCommand("person", "Get what someone said (@user or name)"),
         BotCommand("who", "See who's been active today"),
     ]
     await application.bot.set_my_commands(commands)
@@ -254,17 +280,17 @@ def main():
     logger.info("🚀 Bot is running! Press Ctrl+C to stop.")
     
     # Run polling with drop_pending_updates to prevent conflict errors
-    # This clears any pending updates from previous instances
     try:
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,  # CRITICAL: Prevents conflict errors
-            poll_interval=1.0,          # Check for updates every second
-            timeout=30                  # Long polling timeout
+            drop_pending_updates=True,
+            poll_interval=1.0,
+            timeout=30
         )
     except Conflict as e:
         logger.error(f"❌ Conflict error: {e}")
-        logger.error("⚠️ Another bot instance is running. Please ensure only ONE instance is deployed!")
+        logger.error("⚠️ Another bot instance is running. Waiting 10 seconds...")
+        time.sleep(10)
         sys.exit(1)
     except Exception as e:
         logger.error(f"❌ Unexpected error: {e}")
