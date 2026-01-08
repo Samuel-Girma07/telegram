@@ -5,7 +5,22 @@ from summarizer import Summarizer
 from config import TELEGRAM_TOKEN
 from keep_alive import keep_alive
 import logging
-import nltk
+import nltk  # ADD THIS LINE
+
+# ADD THESE LINES - Download NLTK data on startup
+import os
+nltk_data_dir = '/opt/render/project/.nltk_data'
+os.makedirs(nltk_data_dir, exist_ok=True)
+nltk.data.path.append(nltk_data_dir)
+
+try:
+    nltk.data.find('tokenizers/punkt')
+    print("✅ NLTK punkt data already exists")
+except LookupError:
+    print("📥 Downloading NLTK punkt data...")
+    nltk.download('punkt', download_dir=nltk_data_dir)
+    print("✅ NLTK punkt data downloaded successfully!")
+# END OF NEW CODE
 
 # Enable logging
 logging.basicConfig(
@@ -209,4 +224,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
