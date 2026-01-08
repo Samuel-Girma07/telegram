@@ -1,105 +1,278 @@
-import logging
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import Conflict, NetworkError, TimedOut
+from database import MessageDB
+from summarizer import Summarizer
 from config import TELEGRAM_TOKEN
-import database
-import summarizer
-from keep_alive import keep_alive
+from keep_alive import keep_alive, set_bot_status
+import logging
+import signal
+import sys
+import asyncio
 
-# Logging Setup
+# Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-# --- COMMANDS ---
+# Initialize
+db = MessageDB()
+summarizer = Summarizer()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_type = update.effective_chat.type
-    if chat_type == 'private':
-        await update.message.reply_text("🚫 I only work in Group chats. Add me to a group!")
-        return
+# Global flag for graceful shutdown
+shutdown_flag = False
 
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    global shutdown_flag
+    signal_name = signal.Signals(signum).name
+    logger.info(f"🛑 Received {signal_name}, initiating graceful shutdown...")
+    shutdown_flag = True
+    set_bot_status(False)
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+def is_group_chat(update: Update) -> bool:
+    """Check if message is from a group chat"""
+    return update.effective_chat.type in ['group', 'supergroup']
+
+async def private_chat_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Response for private chats"""
     await update.message.reply_text(
-        "👋 **Summarizer Bot Ready!**\n\n"
-        "I am now recording messages in this group securely.\n\n"
-        "**Commands:**\n"
-        "/catchup - Summarize the last 100 messages\n"
-        "/who - Who is active today?\n"
-        "/person [Name] - Count messages for a user"
+        "🚫 I only work in groups!\n\n"
+        "Add me to a group and make me admin to use my features."
     )
 
-async def catchup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    
-    # Feedback to user
-    status = await update.message.reply_text("🧠 Reading messages & analyzing...")
-    
-    # 1. Get messages strictly for THIS chat_id
-    messages = database.get_messages(chat_id, limit=100)
-    
-    # 2. Generate Summary
-    text_summary = summarizer.summarize_chat(messages)
-    
-    # 3. Send result
-    await status.edit_text(text_summary, parse_mode='Markdown')
-
-async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    users = database.get_active_users(chat_id)
-    
-    if users:
-        msg = "👥 **Active Members (Last 24h):**\n\n" + "\n".join([f"• {u}" for u in users])
-        await update.message.reply_text(msg, parse_mode='Markdown')
-    else:
-        await update.message.reply_text("💤 It's been quiet. No active members recently.")
-
-async def person(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: `/person Name`", parse_mode='Markdown')
+async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save all group messages to database"""
+    if not is_group_chat(update):
         return
     
-    name = context.args[0]
-    chat_id = update.effective_chat.id
-    
-    count = database.get_person_stats(chat_id, name)
-    await update.message.reply_text(f"👤 **{name}** has sent **{count}** messages in this group.")
-
-# --- MESSAGE HANDLER ---
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Saves every message to the DB for the specific group."""
     if update.message and update.message.text:
         chat_id = update.effective_chat.id
-        user = update.message.from_user
-        username = user.username if user.username else user.first_name
-        text = update.message.text
+        user_name = update.effective_user.first_name or "Unknown"
+        message_text = update.message.text
         
-        # Save to database
-        database.save_message(chat_id, user.id, username, text)
+        if not message_text.startswith('/'):
+            db.add_message(chat_id, user_name, message_text)
+            logger.info(f"💾 Saved: {user_name}: {message_text[:30]}...")
 
-# --- MAIN ---
+async def catchup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate summary of all messages"""
+    if not is_group_chat(update):
+        await private_chat_response(update, context)
+        return
+    
+    chat_id = update.effective_chat.id
+    
+    # Parse time parameter
+    if context.args and context.args[0].isdigit():
+        hours = int(context.args[0])
+        messages = db.get_messages_last_hours(chat_id, hours)
+        time_label = f"last {hours} hours"
+    else:
+        messages = db.get_messages_today(chat_id)
+        time_label = "today"
+    
+    if not messages or len(messages) == 0:
+        await update.message.reply_text(
+            "📭 No messages to catch up on!\n"
+            "Messages are saved from when I started running."
+        )
+        return
+    
+    # Generate summary
+    summary = summarizer.summarize(messages)
+    
+    # Get participants
+    participants = list(set([msg[0] for msg in messages]))
+    participants_text = ", ".join(participants)
+    
+    response = (
+        f"📝 *Catch Up Summary ({time_label})*\n\n"
+        f"{summary}\n\n"
+        f"👥 _Participants: {participants_text}_\n"
+        f"💬 _{len(messages)} messages_"
+    )
+    
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+async def who_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show who's been active today"""
+    if not is_group_chat(update):
+        await private_chat_response(update, context)
+        return
+    
+    chat_id = update.effective_chat.id
+    participants = db.get_participants(chat_id)
+    
+    if not participants:
+        await update.message.reply_text("No one has sent messages today yet!")
+        return
+    
+    response = "👥 *Active Today:*\n\n" + "\n".join([f"• {name}" for name in participants])
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+async def person_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get messages from specific person(s)"""
+    if not is_group_chat(update):
+        await private_chat_response(update, context)
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❓ *How to use:*\n\n"
+            "`/person John` - What John said today\n"
+            "`/person John Sarah` - What John & Sarah said\n"
+            "`/person John 3` - What John said in last 3 hours\n\n"
+            "Use `/who` to see who's active today",
+            parse_mode='Markdown'
+        )
+        return
+    
+    chat_id = update.effective_chat.id
+    
+    # Parse arguments: names and optional hours
+    args = context.args
+    hours = None
+    names = []
+    
+    # Check if last argument is a number (hours)
+    if args[-1].isdigit():
+        hours = int(args[-1])
+        names = args[:-1]
+        time_label = f"last {hours} hours"
+    else:
+        names = args
+        time_label = "today"
+    
+    if not names:
+        await update.message.reply_text("Please specify at least one name!")
+        return
+    
+    # Get messages from these people
+    messages = db.get_messages_by_person(chat_id, names, hours)
+    
+    if not messages:
+        names_text = " & ".join(names)
+        await update.message.reply_text(
+            f"📭 No messages from {names_text} {time_label}.\n\n"
+            f"Tip: Names are case-sensitive. Use `/who` to see exact names."
+        )
+        return
+    
+    # Generate summary
+    summary = summarizer.summarize(messages)
+    names_text = " & ".join(names)
+    
+    response = (
+        f"📝 *What {names_text} said ({time_label})*\n\n"
+        f"{summary}\n\n"
+        f"💬 _{len(messages)} messages_"
+    )
+    
+    await update.message.reply_text(response, parse_mode='Markdown')
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command"""
+    if not is_group_chat(update):
+        await update.message.reply_text(
+            "🚫 I only work in groups!\n\n"
+            "To use me:\n"
+            "1️⃣ Add me to your group\n"
+            "2️⃣ Make me admin\n"
+            "3️⃣ Use /catchup to summarize messages"
+        )
+        return
+    
+    await update.message.reply_text(
+        "👋 Hi! I'm your chat summarizer.\n\n"
+        "✅ I'm now saving all messages!\n\n"
+        "Type / to see all available commands.",
+        parse_mode='Markdown'
+    )
+
+async def post_init(application: Application):
+    """Set up the bot commands menu and clear any existing webhooks"""
+    # CRITICAL: Delete any existing webhooks to prevent conflicts
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("🔄 Cleared existing webhooks and pending updates")
+    
+    commands = [
+        BotCommand("start", "Start the bot and see info"),
+        BotCommand("catchup", "Get summary of today's chat"),
+        BotCommand("person", "Get specific person's messages"),
+        BotCommand("who", "See who's been active today"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("✅ Command menu set up successfully!")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors gracefully"""
+    logger.error(f"❌ Exception while handling an update: {context.error}")
+    
+    if isinstance(context.error, Conflict):
+        logger.error("⚠️ Conflict error - another bot instance may be running!")
+    elif isinstance(context.error, (NetworkError, TimedOut)):
+        logger.warning("⚠️ Network error - will retry automatically")
 
 def main():
-    # Initialize DB (Create table if missing)
-    database.init_db()
+    """Main function with robust error handling and retry logic"""
+    logger.info("🤖 Starting Telegram Summarizer Bot...")
+    logger.info("✅ Using local summarization (instant & unlimited)")
     
-    # Start Keep Alive (Web Server)
+    # Start keep_alive server for UptimeRobot
     keep_alive()
+    set_bot_status(True)
     
-    print("🚀 Bot is running...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("catchup", catchup))
-    app.add_handler(CommandHandler("who", who))
-    app.add_handler(CommandHandler("person", person))
+    # Build application with timeout settings
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .build()
+    )
     
-    # Message Listener (Text only, no commands)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    app.run_polling()
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("catchup", catchup_command))
+    application.add_handler(CommandHandler("person", person_command))
+    application.add_handler(CommandHandler("who", who_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_message))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    logger.info("🚀 Bot is running! Press Ctrl+C to stop.")
+    
+    # Run polling with drop_pending_updates to prevent conflict errors
+    # This clears any pending updates from previous instances
+    try:
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,  # CRITICAL: Prevents conflict errors
+            poll_interval=1.0,          # Check for updates every second
+            timeout=30                  # Long polling timeout
+        )
+    except Conflict as e:
+        logger.error(f"❌ Conflict error: {e}")
+        logger.error("⚠️ Another bot instance is running. Please ensure only ONE instance is deployed!")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"❌ Unexpected error: {e}")
+        raise
+    finally:
+        set_bot_status(False)
+        db.close()
+        logger.info("👋 Bot stopped")
 
 if __name__ == '__main__':
     main()

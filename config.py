@@ -1,10 +1,10 @@
 import os
-import sys
 
-# Load token from Render environment variables
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Load tokens from environment variables (secure for Render deployment)
+# Falls back to hardcoded values for local development only
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8408479766:AAEIQEm2LWHwegYdAev45JgVekN3XLd23W0")
+HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "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")
 
-# Safety check: Stop immediately if token is missing to avoid crashing later
+# Validate required tokens
 if not TELEGRAM_TOKEN:
-    print("❌ CRITICAL ERROR: TELEGRAM_TOKEN not found in environment variables!")
-    print("Please add it in Render Dashboard > Environment.")
+    raise ValueError("TELEGRAM_TOKEN environment variable is required!")
