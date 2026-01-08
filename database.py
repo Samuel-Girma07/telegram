@@ -1,93 +1,101 @@
 import sqlite3
-from datetime import datetime, timedelta
+import datetime
 
-class MessageDB:
-    def __init__(self):
-        # check_same_thread=False is required for Telegram bot async threads
-        self.conn = sqlite3.connect('messages.db', check_same_thread=False)
-        self.create_table()
+# Name of the database file
+DB_NAME = "chat_logs.db"
+
+def get_connection():
+    """Create a fresh connection for every single request to prevent data mixing."""
+    conn = sqlite3.connect(DB_NAME)
+    # This allows us to access columns by name (row['message'])
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """Initialize the database table."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER,
+            username TEXT,
+            message_text TEXT,
+            timestamp DATETIME
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_message(chat_id, user_id, username, text):
+    """Save a message securely."""
+    conn = get_connection()
+    c = conn.cursor()
+    now = datetime.datetime.now()
     
-    def create_table(self):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_name TEXT,
-                message_text TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        self.conn.commit()
+    c.execute('''
+        INSERT INTO messages (chat_id, user_id, username, message_text, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (chat_id, user_id, username, text, now))
     
-    def add_message(self, chat_id, user_name, message_text):
-        cursor = self.conn.cursor()
-        # Explicitly pass datetime.now() to ensure timezone consistency
-        now = datetime.now()
-        cursor.execute('''
-            INSERT INTO messages (chat_id, user_name, message_text, timestamp)
-            VALUES (?, ?, ?, ?)
-        ''', (chat_id, user_name, message_text, now))
-        self.conn.commit()
+    conn.commit()
+    conn.close()
+
+def get_messages(chat_id, limit=100):
+    """
+    Get messages ONLY for the specific chat_id.
+    Returns them in chronological order (Oldest -> Newest).
+    """
+    conn = get_connection()
+    c = conn.cursor()
     
-    def get_messages_today(self, chat_id):
-        cursor = self.conn.cursor()
-        today = datetime.now().date()
-        # SQL logic to compare just the date part
-        cursor.execute('''
-            SELECT user_name, message_text, timestamp
-            FROM messages
-            WHERE chat_id = ? AND date(timestamp) = ?
-            ORDER BY timestamp ASC
-        ''', (chat_id, today))
-        return cursor.fetchall()
+    # STRICT filtering by chat_id ensures groups never mix
+    c.execute('''
+        SELECT username, message_text 
+        FROM messages 
+        WHERE chat_id = ? 
+        ORDER BY id DESC 
+        LIMIT ?
+    ''', (chat_id, limit))
     
-    def get_messages_last_hours(self, chat_id, hours):
-        cursor = self.conn.cursor()
-        time_ago = datetime.now() - timedelta(hours=hours)
-        cursor.execute('''
-            SELECT user_name, message_text, timestamp
-            FROM messages
-            WHERE chat_id = ? AND timestamp >= ?
-            ORDER BY timestamp ASC
-        ''', (chat_id, time_ago))
-        return cursor.fetchall()
+    rows = c.fetchall()
+    conn.close()
     
-    def get_messages_by_person(self, chat_id, person_names, hours=None):
-        cursor = self.conn.cursor()
-        
-        # Dynamically create placeholders (?,?,?) based on number of names
-        placeholders = ','.join('?' * len(person_names))
-        
-        if hours:
-            time_ago = datetime.now() - timedelta(hours=hours)
-            query = f'''
-                SELECT user_name, message_text, timestamp
-                FROM messages
-                WHERE chat_id = ? AND user_name IN ({placeholders}) AND timestamp >= ?
-                ORDER BY timestamp ASC
-            '''
-            params = [chat_id] + list(person_names) + [time_ago]
-        else:
-            today = datetime.now().date()
-            query = f'''
-                SELECT user_name, message_text, timestamp
-                FROM messages
-                WHERE chat_id = ? AND user_name IN ({placeholders}) AND date(timestamp) = ?
-                ORDER BY timestamp ASC
-            '''
-            params = [chat_id] + list(person_names) + [today]
-        
-        cursor.execute(query, params)
-        return cursor.fetchall()
+    # Reverse to get chronological order (Oldest first)
+    return rows[::-1]
+
+def get_active_users(chat_id):
+    """Get distinct users from the last 24 hours for a specific group."""
+    conn = get_connection()
+    c = conn.cursor()
     
-    def get_participants(self, chat_id):
-        cursor = self.conn.cursor()
-        today = datetime.now().date()
-        cursor.execute('''
-            SELECT DISTINCT user_name
-            FROM messages
-            WHERE chat_id = ? AND date(timestamp) = ?
-            ORDER BY user_name
-        ''', (chat_id, today))
-        return [row[0] for row in cursor.fetchall()]
+    yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+    
+    c.execute('''
+        SELECT DISTINCT username 
+        FROM messages 
+        WHERE chat_id = ? AND timestamp > ?
+    ''', (chat_id, yesterday))
+    
+    users = [row['username'] for row in c.fetchall() if row['username']]
+    conn.close()
+    return users
+
+def get_person_stats(chat_id, target_name):
+    """Count messages for a specific person in a specific group."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # Remove @ if typed by user
+    clean_name = target_name.replace("@", "")
+    
+    c.execute('''
+        SELECT COUNT(*) 
+        FROM messages 
+        WHERE chat_id = ? AND username LIKE ?
+    ''', (chat_id, f"%{clean_name}%"))
+    
+    count = c.fetchone()[0]
+    conn.close()
+    return count
