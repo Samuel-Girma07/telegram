@@ -1,4 +1,4 @@
 python-telegram-bot==21.6
 nltk==3.8.1
-sumy==0.12.0
+sumy==0.11.0
 flask==3.0.0
